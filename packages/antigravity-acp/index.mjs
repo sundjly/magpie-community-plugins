@@ -2,10 +2,12 @@
 // provider plugin for magpie.
 //
 // Antigravity's ACP server (agy_acp_server.par, dl.google.com) is the agent
-// runtime the Antigravity IDE speaks. It owns the Google sign-in itself:
-// OAuth tokens live in ~/.gemini/antigravity-acp/ and only the server
-// refreshes them, so this plugin stores a marker, never a token, and one
-// Google sign-in is shared by every account of this provider on a machine.
+// runtime the Antigravity IDE speaks. It owns the Google sign-in itself, and
+// decides alone where it keeps it (an install with the IDE signed in may
+// carry no token file at all), so the plugin stores a marker, never a token,
+// and reads the sign-in's health from the server's own answers: a session
+// can be made signed-out, but only a real credential gets a prompt through.
+// One Google sign-in is shared by every account of this provider.
 //
 // A request arrives as the model's OpenAI Chat body (the models are on
 // @ai-sdk/openai-compatible). The plugin turns it into one ACP session:
@@ -556,18 +558,16 @@ const isAuthError = (e) => e?.code === -32000 || /authentication required/i.test
 
 // ---- the Google sign-in the server keeps -----------------------------------
 
-// localAuth is what the server keeps in ~/.gemini/antigravity-acp: a token
-// file with a refresh token, and settings naming the auth kind. Secrets stay
-// there; only their shape is read.
+// localAuth is what can be read of the server's sign-in without asking it:
+// the settings' auth kind, and an email when a token file names one. It is
+// never a verdict — the server decides where its tokens live — only a hint.
 function localAuth() {
   const dir = authDir()
   const settings = readJSON(path.join(dir, "settings.json"))
   const token = readJSON(path.join(dir, "acp_token.json"))
   const kind = typeof settings?.auth?.type === "string" ? settings.auth.type : undefined
-  const tokenOk = typeof token?.refresh_token === "string" && token.refresh_token.length > 0
-  if (process.env.GEMINI_API_KEY) return { ok: true, kind: "gemini-api-key", email: "" }
-  if (tokenOk) return { ok: true, kind: kind ?? "oauth-personal", email: typeof token?.email === "string" ? token.email : "" }
-  return { ok: false, kind, email: "" }
+  const email = typeof token?.email === "string" ? token.email : ""
+  return { kind, email }
 }
 
 // configureDefaultAuth writes the settings the server reads before its first
@@ -777,36 +777,55 @@ async function googleSignIn() {
 }
 
 // saved is the marker stored for this provider: the server keeps the tokens.
-const saved = () => {
-  const who = localAuth()
-  return {
-    type: "success",
-    refresh: MANAGED,
-    access: MANAGED,
-    expires: Date.now() + 10 * 365 * 24 * 3600 * 1000,
-    ...(who.email ? { accountId: who.email } : {}),
-  }
+const saved = () => ({
+  type: "success",
+  refresh: MANAGED,
+  access: MANAGED,
+  expires: Date.now() + 10 * 365 * 24 * 3600 * 1000,
+  ...(localAuth().email ? { accountId: localAuth().email } : {}),
+})
+
+// signedIn proves the server really has a credential by asking it for one
+// word: a session is made signed-out too, but only a credential gets a
+// prompt through. The server answers an existing sign-in at once; without
+// one it drives the browser itself.
+async function signedIn(conn) {
+  const session = await conn.newSession(workDir(), [], 60_000)
+  const r = await conn.request("session/prompt", { sessionId: session.sessionId, prompt: [{ type: "text", text: "Reply with exactly: OK" }] }, 90_000)
+  conn.cancel(session.sessionId)
+  if (r?.stopReason !== "end_turn" && r?.stopReason !== "cancelled") throw new Error("the server did not answer the probe")
 }
 
-// done checks the sign-in took (a session can be made) and saves the marker.
+// done checks the sign-in took and saves the marker.
 async function done(conn) {
   try {
-    await conn.newSession(workDir(), [], 60_000)
+    await signedIn(conn)
   } catch (e) {
     return { type: "failed", error: isAuthError(e) ? "the sign-in didn't take: Antigravity still asks for authentication" : String(e?.message ?? e) }
   }
   return saved()
 }
 
-// currentSignIn takes the Google sign-in Antigravity already has on this
-// machine, as it is.
+// currentSignIn takes the Google sign-in the server already has (an install
+// with the Antigravity IDE signed in usually has one): the probe settles it.
 async function currentSignIn() {
-  await ensureRuntime()
-  const who = localAuth()
-  if (!who.ok) throw new Error("Antigravity has no Google sign-in on this machine yet; sign in with the browser one first")
+  const launch = await ensureRuntime()
+  const conn = new AcpConnection({ command: launch.command, args: launch.args, cwd: workDir() })
+  conn.start()
+  try {
+    await conn.initialize()
+    try {
+      await signedIn(conn)
+    } catch {
+      throw new Error("Antigravity has no Google sign-in on this machine yet; sign in with the browser one first")
+    } finally { conn.kill() }
+  } catch (e) {
+    if (e?.message?.includes("no Google sign-in")) throw e
+    throw new Error("the Antigravity ACP server could not be started: " + String(e?.message ?? e))
+  }
   return {
     url: "",
-    instructions: who.email ? `Using Antigravity's Google sign-in as ${who.email}.` : "Using Antigravity's Google sign-in.",
+    instructions: localAuth().email ? `Using Antigravity's Google sign-in as ${localAuth().email}.` : "Using Antigravity's Google sign-in.",
     method: "auto",
     callback: async () => saved(),
   }
@@ -1305,7 +1324,9 @@ function wholeReply(req, turn, finish, signal) {
 async function handleChat(getAuth, input, init) {
   const auth = await getAuth()
   if (!auth || (auth.type !== "oauth" && auth.type !== "api")) throw expired("Antigravity is not signed in; sign in from the provider's page")
-  if (auth.type === "oauth" && !localAuth().ok) throw expired("Antigravity's Google sign-in is gone from this machine; sign in again")
+  // no local gate: the server decides where its sign-in lives, and a lost
+  // one surfaces as the server refusing a prompt (-32000), which is marked
+  // below, as it should be
 
   const req = parseChat(init?.body)
   const wantStream = req.stream === true
@@ -1447,10 +1468,9 @@ export const AntigravityAcpPlugin = async (input = {}) => {
 
     auth: {
       provider: PROVIDER,
-      async refresh(auth) {
-        // the marker never expires; the server's own tokens are its own. A
-        // sign-in that left this machine is worth knowing about, not renewing.
-        if (auth?.type === "oauth" && !localAuth().ok) throw expired("Antigravity's Google sign-in is gone from this machine; sign in again")
+      async refresh() {
+        // the marker never expires and the server's tokens are its own; a
+        // really lost sign-in says so when a request is made (-32000)
         return undefined
       },
       async loader(getAuth) {
@@ -1467,19 +1487,16 @@ export const AntigravityAcpPlugin = async (input = {}) => {
         { type: "oauth", label: "Use Antigravity's current Google sign-in", authorize: currentSignIn },
         { type: "api", label: "Gemini API key", placeholder: "AIza…" },
       ],
-      async usage(getAuth) {
-        // how the shared sign-in is doing, as the last prompt's answer said
-        const auth = await getAuth()
-        if (auth?.type === "oauth" && !localAuth().ok) return { error: "Antigravity's Google sign-in is gone from this machine; sign in again", windows: [], signIn: "expired" }
+      async usage() {
+        // how the shared sign-in is doing, as the last prompt's answer said;
+        // a really lost sign-in is marked by the request that finds it
         const windows = []
-        if (lastQuota) {
-          if (typeof lastQuota.used === "number") {
-            windows.push({
-              name: "Antigravity quota",
-              used: lastQuota.used,
-              ...(lastQuota.resetsAt ? { resetsAt: lastQuota.resetsAt } : {}),
-            })
-          }
+        if (lastQuota && typeof lastQuota.used === "number") {
+          windows.push({
+            name: "Antigravity quota",
+            used: lastQuota.used,
+            ...(lastQuota.resetsAt ? { resetsAt: lastQuota.resetsAt } : {}),
+          })
         }
         return { plan: lastQuota?.tier || "Antigravity", windows }
       },
@@ -1509,4 +1526,5 @@ export const AntigravityAcpPlugin = async (input = {}) => {
 export const _internal = {
   projectModels, resolveServerId, buildPrompt, parseChat, localAuth, configureDefaultAuth,
   Bridge, Turn, noteQuota, sessionModels, resolveLaunch, platformKey, setIndex: (m) => (familyIndex = m),
+  AcpConnection, authDir,
 }

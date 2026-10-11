@@ -169,16 +169,11 @@ const URL_ = "https://antigravity-acp.invalid/v1/chat/completions"
   ok("usage reads the quota the prompt answered with")
 }
 
-// refresh is a no-op while the local sign-in stands, and expired without it
+// refresh is a no-op: the server owns the tokens, wherever it keeps them
 {
   const nothing = await plugin.auth.refresh({ type: "oauth", refresh: "x" })
   if (nothing !== undefined) fail(`refresh: ${JSON.stringify(nothing)}`)
-  let threw = null
-  process.env.AGY_ACP_AUTH_DIR = path.join(home, "nowhere")
-  try { await plugin.auth.refresh({ type: "oauth", refresh: "x" }) } catch (e) { threw = e }
-  process.env.AGY_ACP_AUTH_DIR = path.join(home, ".gemini", "antigravity-acp")
-  if (!threw || threw.signIn !== "expired") fail(`refresh without a sign-in: ${JSON.stringify(String(threw))}`)
-  ok("refresh keeps the account, and says expired when the sign-in is gone")
+  ok("refresh leaves the sign-in to the server")
 }
 
 // projectModels directly
