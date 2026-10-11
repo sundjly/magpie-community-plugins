@@ -1,5 +1,7 @@
 # opencode-antigravity-acp-auth
 
+English | [简体中文](README.zh-CN.md)
+
 A magpie (OpenCode) provider plugin for **Google Antigravity through its official ACP server** — the agent runtime the Antigravity IDE speaks (`agy_acp_server.par`, served by dl.google.com), driven over Agent Client Protocol v1.
 
 Adapted from [`pi-antigravity-acp-provider`](https://github.com/zacbemis/pi-antigravity-acp-provider) (MIT): the pinned runtime manifest, the runtime discovery order and install/validation flow, the model-family folding algorithm, the headless OAuth relay, and parts of the ACP session lifecycle are derived from it, reshaped for magpie's plugin contract. Its license notice is carried in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
