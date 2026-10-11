@@ -6,7 +6,7 @@ Modeled on `pi-antigravity-acp-provider`, reshaped for magpie's plugin contract.
 
 ## How it works
 
-- **Sign-in**: the ACP server owns the Google sign-in. Its OAuth tokens live in `~/.gemini/antigravity-acp/` and only the server refreshes them; the plugin stores a marker, never a token. One Google sign-in is shared by every account of this provider on a machine. Three ways to sign in:
+- **Sign-in**: the ACP server owns the Google sign-in and decides alone where it keeps it (an install with the IDE signed in may carry no token file at all); the plugin stores a marker, never a token, and reads the sign-in's health from the server's own answers — a session can be made signed-out, but only a credential gets a prompt through. One Google sign-in is shared by every account of this provider on a machine. Three ways to sign in:
   - *Sign in with Google* — the server opens a browser. On SSH or a headless Linux the OAuth URL is captured and shown instead; paste the final localhost URL back.
   - *Use Antigravity's current Google sign-in* — a sign-in the Antigravity IDE already made on this machine.
   - *Gemini API key* — authenticated to the server with `_meta.api-key`.
