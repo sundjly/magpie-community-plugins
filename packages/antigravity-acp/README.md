@@ -2,7 +2,7 @@
 
 A magpie (OpenCode) provider plugin for **Google Antigravity through its official ACP server** — the agent runtime the Antigravity IDE speaks (`agy_acp_server.par`, served by dl.google.com), driven over Agent Client Protocol v1.
 
-Modeled on `pi-antigravity-acp-provider`, reshaped for magpie's plugin contract.
+Adapted from [`pi-antigravity-acp-provider`](https://github.com/zacbemis/pi-antigravity-acp-provider) (MIT): the pinned runtime manifest, the runtime discovery order and install/validation flow, the model-family folding algorithm, the headless OAuth relay, and parts of the ACP session lifecycle are derived from it, reshaped for magpie's plugin contract. Its license notice is carried in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
 
 > **Requires the Antigravity IDE, installed and signed in with your Google account.** The ACP server rides the IDE's Google sign-in — that is the supported path, and the one verified against the current server (1.2.1). The plugin downloads Google's official `agy_acp_server.par` itself; the IDE is not driven by the plugin, it is where the credential lives.
 
@@ -60,3 +60,7 @@ This plugin is one notch safer on that axis — every byte to Google comes from 
 ```sh
 node test/smoke.mjs   # the whole plugin against a fake ACP server; no download, no Google
 ```
+
+## License
+
+MIT — see [LICENSE](../../LICENSE) at the repository root. Adapted from `pi-antigravity-acp-provider` (MIT); its notice is in [THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
