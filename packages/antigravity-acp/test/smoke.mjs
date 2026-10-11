@@ -2,7 +2,6 @@
 // by test/fake-acp-server.mjs behind AGY_ACP_BIN, and the sign-in it keeps is
 // faked in a temporary AGY_ACP_HOME. Exercises the config, sign-in, models,
 // usage, and streaming / tool-call / non-streaming fetch paths end to end.
-import { execFileSync } from "node:child_process"
 import fs from "node:fs"
 import os from "node:os"
 import path from "node:path"
@@ -23,7 +22,12 @@ fs.mkdirSync(process.env.AGY_ACP_AUTH_DIR, { recursive: true })
 fs.writeFileSync(path.join(process.env.AGY_ACP_AUTH_DIR, "settings.json"), JSON.stringify({ auth: { type: "oauth-personal" } }))
 fs.writeFileSync(path.join(process.env.AGY_ACP_AUTH_DIR, "acp_token.json"), JSON.stringify({ refresh_token: "x", email: "me@example.com" }))
 
-// the fake server as an executable the launcher accepts (a shebang wrapper)
+// the fake server as an executable the launcher accepts (a shebang wrapper;
+// the smoke test needs a POSIX shell for that, so on Windows it skips)
+if (process.platform === "win32") {
+  console.log("skip - the fake ACP server needs a POSIX shell; run the smoke test on macOS/Linux")
+  process.exit(0)
+}
 const bin = path.join(home, "bin")
 fs.mkdirSync(bin, { recursive: true })
 const wrapper = path.join(bin, "agy_acp_server.par")
@@ -190,6 +194,6 @@ const URL_ = "https://antigravity-acp.invalid/v1/chat/completions"
   ok(`projectModels folds families, keeps one-offs (${ids.join(", ")})`)
 }
 
-execFileSync("rm", ["-rf", home])
+fs.rmSync(home, { recursive: true, force: true })
 console.log("\nsmoke passed")
 process.exit(0)

@@ -93,7 +93,8 @@ function launchArgs(command) {
 function resolveLaunch() {
   const env = process.env.AGY_ACP_BIN?.trim()
   if (env) {
-    const p = env === "~" || env.startsWith("~/") ? path.join(homeDir(), env.slice(1)) : env
+    const tilde = env.match(/^~([\/\\])(.*)$/)
+    const p = tilde ? path.join(homeDir(), tilde[2]) : env
     if (executable(p)) return { command: p, args: launchArgs(p), source: "env" }
   }
   const managed = path.join(runtimeRoot(), "current", binaryName())
@@ -155,7 +156,9 @@ async function withInstallLock(fn) {
       if (e?.code !== "EEXIST") throw e
       let born = 0
       try { born = fs.statSync(dir).mtimeMs } catch {}
-      if (Date.now() - born > 30 * 60_000) { try { fs.rmdirSync(dir) } catch {} }
+      // a lock left by a dead process is taken back before the wait itself
+      // runs out, so the stale branch is reachable
+      if (Date.now() - born > 10 * 60_000) { try { fs.rmdirSync(dir) } catch {} }
       if (Date.now() > end) throw new Error("another Antigravity ACP install has been running for over 15 minutes")
       await sleep(1000)
     }
@@ -247,8 +250,9 @@ async function download(asset, destination) {
 async function extract(archive, runtime, asset) {
   const keep = new Set([asset.binaryName, asset.harnessName])
   if (process.platform === "win32") {
+    const quote = (s) => s.replace(/'/g, "''")
     await runFile("powershell.exe", ["-NoProfile", "-NonInteractive", "-Command",
-      `Expand-Archive -LiteralPath '${archive}' -DestinationPath '${runtime}' -Force`])
+      `Expand-Archive -LiteralPath '${quote(archive)}' -DestinationPath '${quote(runtime)}' -Force`])
     for (const entry of fs.readdirSync(runtime)) if (!keep.has(entry)) fs.rmSync(path.join(runtime, entry), { recursive: true, force: true })
     return
   }
@@ -308,6 +312,10 @@ async function isAgyServer(pid) {
   try {
     if (process.platform === "linux") return fs.readFileSync(`/proc/${pid}/cmdline`, "utf8").includes("agy_acp_server")
     if (process.platform === "darwin") return (await runFile("ps", ["-p", String(pid), "-o", "args="])).includes("agy_acp_server")
+    if (process.platform === "win32") {
+      const out = await runFile("tasklist", ["/FI", `PID eq ${pid}`, "/FO", "CSV", "/NH"])
+      return out.toLowerCase().includes("agy_acp_server")
+    }
   } catch {}
   return false
 }
@@ -362,6 +370,11 @@ class AcpConnection {
     this.#child = child
     track(child)
     notePid(this.command, child.pid)
+    // a server that can't start (ENOENT, EACCES) raises "error", and a write
+    // to one that just died raises EPIPE on stdin; either left alone would
+    // take the whole host down
+    child.on("error", (e) => this.#fail(new Error(`the Antigravity ACP server could not be started: ${e?.message ?? e}`)))
+    child.stdin?.on?.("error", () => {})
     let buffer = ""
     child.stdout.setEncoding("utf8")
     child.stdout.on("data", (chunk) => {
@@ -405,6 +418,11 @@ class AcpConnection {
       else p.resolve(msg.result)
       return
     }
+    if (msg.method === undefined && msg.id === null && msg.error) {
+      // an error with no request behind it (a body the server couldn't read)
+      // is a broken transport, not one failed call
+      return this.#fail(acpError(msg.error))
+    }
     if (typeof msg.method !== "string") return
     if (msg.id !== undefined) {
       // a request of the server's: permission requests are turned down, so
@@ -435,6 +453,13 @@ class AcpConnection {
   respondError(id, code, message) { try { this.#write({ jsonrpc: "2.0", id, error: { code, message } }) } catch {} }
 
   request(method, params, timeoutMs = OP_TIMEOUT) {
+    return this.call(method, params, timeoutMs).promise
+  }
+
+  // call is request with a handle to give the wait up: a prompt cancelled
+  // early leaves the pending table, so its timeout can't fire later and kill
+  // a server other requests are still using
+  call(method, params, timeoutMs = OP_TIMEOUT) {
     if (!this.#child) throw new Error("the Antigravity ACP server was never started")
     const id = this.nextId++
     let timer
@@ -452,7 +477,13 @@ class AcpConnection {
       if (p) { clearTimeout(p.timer); this.pending.delete(id) }
       throw e
     }
-    return promise
+    return {
+      promise,
+      abandon: () => {
+        const p = this.pending.get(id)
+        if (p) { clearTimeout(p.timer); this.pending.delete(id); p.resolve(null) }
+      },
+    }
   }
 
   notify(method, params) { try { this.#write({ jsonrpc: "2.0", method, params }) } catch {} }
@@ -493,6 +524,9 @@ class AcpConnection {
       p.reject(error)
     }
     this.pending.clear()
+    // a server that spoke nonsense or died is no good to the pool: stop it,
+    // so a live-looking process isn't handed out again
+    this.kill()
   }
 
   cancel(sessionId) { this.notify("session/cancel", { sessionId }) }
@@ -616,13 +650,17 @@ class OAuthRelay {
     this.capture = path.join(this.dir, "authorization-url")
     const helper = (name) => {
       const p = path.join(this.dir, name)
-      fs.writeFileSync(p, `#!/bin/sh\numask 077\nprintf '%s\\n' "$1" > '${this.capture}'\n`, { mode: 0o700 })
+      // the capture file's path reaches the script through the environment,
+      // never through a quoted string: a TMPDIR with a quote in it must not
+      // break the script, let alone run its contents
+      fs.writeFileSync(p, `#!/bin/sh\numask 077\nprintf '%s\\n' "$1" > "$AGY_ACP_CAPTURE"\n`, { mode: 0o700 })
       return p
     }
     const browser = helper("capture-browser")
     this.env = {
       ...process.env,
       BROWSER: browser,
+      AGY_ACP_CAPTURE: this.capture,
       PATH: `${this.dir}${path.delimiter}${process.env.PATH ?? ""}`,
     }
   }
@@ -730,8 +768,11 @@ async function googleSignIn() {
       },
     }
   } catch (e) {
+    // a failure is the host's to show: authorize throws, the sign-in RPC
+    // errors, and magpie says why (a made-up return value would only break
+    // the contract)
     cleanup()
-    return { type: "failed", error: String(e?.message ?? e) }
+    throw e
   }
 }
 
@@ -872,6 +913,16 @@ function resolveServerId(model, effort) {
 
 let familyIndex = new Map()
 
+// the fallbacks are indexed the way a discovery would: a request naming one
+// resolves to the server's effort-qualified id even before (or without) a
+// models listing, and without an effort asked, at the highest tier there is
+for (const [id, m] of Object.entries(FALLBACK_MODELS)) {
+  familyIndex.set(id, {
+    byEffort: Object.fromEntries(Object.keys(m.variants).map((e) => [e, `${id}-${e}`])),
+    plain: "",
+  })
+}
+
 async function discoverModels(auth) {
   const conn = await connectionFor(auth)
   const session = await conn.newSession(workDir(), [])
@@ -926,10 +977,13 @@ class Bridge {
     if (this.empty) return Promise.resolve()
     return new Promise((resolve, reject) => {
       const server = http.createServer((req, res) => {
-        try { this.#handle(req, res) } catch {
-          if (!res.headersSent) res.writeHead(500, { "content-type": "application/json" })
-          res.end(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32603, message: "bridge error" } }))
-        }
+        // #handle is async: a rejection left alone would be unhandled
+        Promise.resolve(this.#handle(req, res)).catch(() => {
+          try {
+            if (!res.headersSent) res.writeHead(500, { "content-type": "application/json" })
+            res.end(JSON.stringify({ jsonrpc: "2.0", id: null, error: { code: -32603, message: "bridge error" } }))
+          } catch {}
+        })
       })
       server.on("error", reject)
       server.listen(0, "127.0.0.1", () => {
@@ -1090,6 +1144,7 @@ class Turn {
     this.text = ""
     this.thought = ""
     this.calls = []
+    this.quota = null
     this.usage = null
     this.stop = null
     this.error = null
@@ -1139,8 +1194,9 @@ class Turn {
   }
 }
 
-// the last quota the server said, for the Usage card (all accounts of this
-// provider share the machine's one Google sign-in, so one note serves all).
+// the last quota any prompt said, for the Usage card (all accounts of this
+// provider share the machine's one Google sign-in, so one note serves all);
+// each turn also keeps its own, so a reply's usage is its own.
 let lastQuota = null
 
 function noteQuota(response) {
@@ -1150,7 +1206,7 @@ function noteQuota(response) {
   const remaining = num(quota.remainingRequests) ?? num(quota.remainingQueries) ?? num(quota.remaining)
   const limit = num(quota.requestLimit) ?? num(quota.queryLimit) ?? num(quota.limit)
   const reset = quota.resetTimestamp ?? quota.resetAt ?? quota.reset_time
-  lastQuota = {
+  const said = {
     at: Date.now(),
     tier: typeof (quota.tier ?? quota.plan) === "string" ? (quota.tier ?? quota.plan) : "",
     used: remaining !== undefined && limit ? Math.round(Math.max(0, Math.min(100, (1 - remaining / limit) * 100)) * 10) / 10 : undefined,
@@ -1159,7 +1215,11 @@ function noteQuota(response) {
     output: num(usage.outputTokens ?? usage.output_tokens) ?? num(quota.token_count?.output_tokens) ?? 0,
     thought: num(usage.thoughtTokens) ?? 0,
   }
+  lastQuota = said
+  return said
 }
+
+const usageOf = (q) => (q && (q.input || q.output) ? { prompt_tokens: q.input, completion_tokens: q.output, total_tokens: q.input + q.output } : undefined)
 
 async function setSessionModel(conn, session, modelId) {
   const selector = (session?.configOptions ?? []).find((o) => o?.type === "select" && (o.category === "model" || o.id === "model"))
@@ -1173,14 +1233,19 @@ async function setSessionModel(conn, session, modelId) {
 
 const SSE_HEAD = { "content-type": "text/event-stream", "cache-control": "no-cache", connection: "keep-alive" }
 
-function streamReply(req, run) {
+function streamReply(req, run, onCancel, quota) {
   const id = `chatcmpl-${randomUUID()}`
   const created = Math.floor(Date.now() / 1000)
   const encoder = new TextEncoder()
   let controller = null
   const stream = new ReadableStream({
     start(c) { controller = c },
-    cancel() { controller = null },
+    // a reader that went away (the client hung up) ends the turn too, so the
+    // prompt doesn't run on unheard
+    cancel() {
+      controller = null
+      try { onCancel?.() } catch {}
+    },
   })
   const push = (delta, finish = null) => {
     try {
@@ -1202,7 +1267,7 @@ function streamReply(req, run) {
       try { controller?.enqueue(encoder.encode(`data: ${JSON.stringify({
         id, object: "chat.completion.chunk", created, model: req.model,
         choices: [{ index: 0, delta: {}, finish_reason: finish }],
-        ...(lastQuota && (lastQuota.input || lastQuota.output) ? { usage: { prompt_tokens: lastQuota.input, completion_tokens: lastQuota.output, total_tokens: lastQuota.input + lastQuota.output } } : {}),
+        ...(usageOf(quota?.()) ? { usage: usageOf(quota()) } : {}),
       })}\n\n`)) } catch {}
       try { controller?.enqueue(encoder.encode("data: [DONE]\n\n")) } catch {}
       try { controller?.close() } catch {}
@@ -1232,7 +1297,7 @@ function wholeReply(req, turn, finish, signal) {
     created: Math.floor(Date.now() / 1000),
     model: req.model,
     choices: [{ index: 0, message, finish_reason: finish }],
-    ...(lastQuota && (lastQuota.input || lastQuota.output) ? { usage: { prompt_tokens: lastQuota.input, completion_tokens: lastQuota.output, total_tokens: lastQuota.input + lastQuota.output } } : {}),
+    ...(usageOf(turn.quota) ? { usage: usageOf(turn.quota) } : {}),
   })
 }
 
@@ -1270,20 +1335,28 @@ async function handleChat(getAuth, input, init) {
     turn.sessionId = session.sessionId
     await setSessionModel(conn, session, resolveServerId(String(req.model ?? ""), String(req.reasoning_effort ?? "")))
     // the history rides as one embedded context; a server without that
-    // capability takes the same text plainly
-    if (markdown && capabilities?.promptCapabilities?.embeddedContext !== true) {
+    // capability takes the same text plainly, and one without image input
+    // takes a note instead of the picture
+    const promptCaps = capabilities?.promptCapabilities ?? {}
+    if (markdown && promptCaps.embeddedContext !== true) {
       const at = prompt.findIndex((b) => b.type === "resource")
       if (at >= 0) prompt.splice(at, 1, { type: "text", text: markdown })
+    }
+    if (promptCaps.image !== true) {
+      for (let i = 0; i < prompt.length; i++) {
+        if (prompt[i].type === "image") prompt.splice(i, 1, { type: "text", text: "[an image was omitted: this Antigravity server does not take image input]" })
+      }
     }
     stopUpdates = conn.onSessionUpdate((params) => {
       if (params?.sessionId === session.sessionId) turn.update(params)
     })
+    // from here the teardown has more to undo; the reply can also outlive
+    // this function when it streams, so cleanup waits for the turn
+    cleanup = () => { stopUpdates(); bridge.close() }
     if (!bridge.empty) bridge.onCall = (call) => turn.addCall(call.name, call.args)
     onAbort = () => { conn.cancel(session.sessionId); turn.finish(turn.calls.length ? "tool_calls" : "stop") }
     signal?.addEventListener("abort", onAbort, { once: true })
     if (signal?.aborted) onAbort()
-    // the reply outlives this function when it streams, so the teardown waits
-    // for the turn; until then the updates and the bridge must stay
     cleanup = () => {
       signal?.removeEventListener("abort", onAbort)
       stopUpdates()
@@ -1291,24 +1364,27 @@ async function handleChat(getAuth, input, init) {
     }
 
     const promptDone = conn
-      .request("session/prompt", { sessionId: session.sessionId, prompt }, PROMPT_TIMEOUT)
-      .then((r) => {
-        noteQuota(r)
-        return r
-      })
-    promptDone.catch(() => {})
+      .call("session/prompt", { sessionId: session.sessionId, prompt }, PROMPT_TIMEOUT)
+    const promptReply = promptDone.promise.then((r) => {
+      if (!r) return r
+      turn.quota = noteQuota(r)
+      return r
+    })
+    promptReply.catch(() => {})
 
     // settleTurn ends the turn the first time the chat protocol must: the
     // prompt answered, a client tool was called, or the request was aborted.
     const settleTurn = async () => {
       const outcome = await Promise.race([
         turn.ended.then(() => "turn"),
-        promptDone.then(() => "prompt", (e) => e),
+        promptReply.then(() => "prompt", (e) => e),
       ])
       if (outcome === "turn") {
-        // ended early (tool calls or an abort): the prompt is cancelled, its
-        // answer of no further use
+        // ended early (tool calls or an abort): the prompt is cancelled and
+        // its wait given up, so the timeout can't later kill a server other
+        // requests are still using
         conn.cancel(session.sessionId)
+        promptDone.abandon()
       } else if (outcome instanceof Error) {
         turn.fail(outcome)
       } else {
@@ -1332,7 +1408,7 @@ async function handleChat(getAuth, input, init) {
         } finally {
           cleanup()
         }
-      })
+      }, () => onAbort(), () => turn.quota)
     }
     try {
       await settleTurn()
