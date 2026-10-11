@@ -292,20 +292,40 @@ async function validateInstall(runtime, asset, version) {
 // A magpie killed hard leaves its ACP server running; the pid file lets the
 // next start take it back. Only a process whose command line names the
 // server is killed, so a recycled pid costs nothing.
-const pidFile = () => path.join(authDir(), "magpie-acp-pids.json")
+// Each host process keeps its own pid file, named for it: a server belongs
+// to the process that spawned it, and only a host that has died has its
+// servers reaped. One shared file would have every magpie process killing
+// every other's live server (a CLI command would take down the app's).
+const pidFile = (owner = process.pid) => path.join(authDir(), `magpie-acp-pids-${owner}.json`)
 let reaped = false
 async function reapStale() {
   if (reaped) return
   reaped = true
-  const all = readJSON(pidFile())
-  if (!Array.isArray(all)) return
-  const keep = []
-  for (const e of all.slice(-8)) {
-    if (!e || typeof e.pid !== "number" || e.pid === process.pid) continue
-    if (await isAgyServer(e.pid)) killTree(e.pid)
-    else if (alive(e.pid)) keep.push(e)
+  try {
+    fs.mkdirSync(authDir(), { recursive: true, mode: 0o700 })
+    for (const f of fs.readdirSync(authDir())) {
+      const owner = f.match(/^magpie-acp-pids-(\d+)\.json$/)?.[1]
+      if (owner !== undefined) {
+        if (Number(owner) === process.pid || alive(Number(owner))) continue
+        await reapFile(path.join(authDir(), f))
+      } else if (f === "magpie-acp-pids.json") {
+        // the pre-ownership shared file: its servers have no living owner of
+        // their own on record, so the identity check decides
+        await reapFile(path.join(authDir(), f))
+      }
+    }
+  } catch {}
+}
+
+async function reapFile(file) {
+  const all = readJSON(file)
+  if (Array.isArray(all)) {
+    for (const e of all.slice(-8)) {
+      if (!e || typeof e.pid !== "number" || e.pid === process.pid) continue
+      if (await isAgyServer(e.pid)) killTree(e.pid)
+    }
   }
-  try { fs.writeFileSync(pidFile(), JSON.stringify(keep)) } catch {}
+  try { fs.rmSync(file, { force: true }) } catch {}
 }
 
 const alive = (pid) => { try { process.kill(pid, 0); return true } catch { return false } }
@@ -337,7 +357,6 @@ function notePid(command, pid) {
     fs.writeFileSync(pidFile(), JSON.stringify(all.slice(-8)))
   } catch {}
 }
-
 // ---- the ACP wire ----------------------------------------------------------
 
 // AcpConnection is one server process, newline-delimited JSON-RPC over its
@@ -897,12 +916,16 @@ function projectModels(raw) {
       for (const member of group.members) byEffort[member.effort] ??= member.modelId.trim()
       const bases = group.members.map((x) => x.modelId.trim().replace(/-(low|medium|high)$/, ""))
       const id2 = bases.length && bases.every((b) => b === bases[0]) ? bases[0] : group.name.toLowerCase().replace(/[^a-z0-9.]+/g, "-").replace(/^-+|-+$/g, "")
+      // the plain id only when the family really has an unqualified member:
+      // a family of qualified ids alone (the usual rollout) has none, and a
+      // request without an effort takes the highest tier instead
+      const plainMember = group.members.find((x) => !/-(low|medium|high)$/.test(x.modelId.trim()))
       out.push({
         id: id2,
         name: group.name,
         efforts: Object.keys(byEffort),
         byEffort,
-        plain: bases[0] ?? "",
+        plain: plainMember ? plainMember.modelId.trim() : "",
       })
       continue
     }
@@ -1320,8 +1343,10 @@ function wholeReply(req, turn, finish, signal) {
   })
 }
 
-// handleChat is the loader's fetch: the whole upstream.
-async function handleChat(getAuth, input, init) {
+// handleChat is the loader's fetch: the whole upstream. A pooled server that
+// died under the request (killed from outside) retries once on a fresh one —
+// but only while nothing has been streamed, so a reply is never doubled.
+async function handleChat(getAuth, input, init, retried = false) {
   const auth = await getAuth()
   if (!auth || (auth.type !== "oauth" && auth.type !== "api")) throw expired("Antigravity is not signed in; sign in from the provider's page")
   // no local gate: the server decides where its sign-in lives, and a lost
@@ -1439,6 +1464,11 @@ async function handleChat(getAuth, input, init) {
     return wholeReply(req, turn, finishOf(), signal)
   } catch (e) {
     cleanup()
+    const transport = /isn't running|exited \(|could not be started/i.test(String(e?.message ?? e))
+    if (transport && !retried && (!turn || (!turn.text && !turn.thought && !turn.calls.length))) {
+      pools.delete(auth.type === "api" ? "api" : "oauth")
+      return handleChat(getAuth, input, init, true)
+    }
     if (isAuthError(e)) throw expired("Antigravity asks to be signed in again")
     throw e
   }
