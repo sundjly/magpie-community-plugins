@@ -4,10 +4,19 @@ A magpie (OpenCode) provider plugin for **Google Antigravity through its officia
 
 Modeled on `pi-antigravity-acp-provider`, reshaped for magpie's plugin contract.
 
+> **Requires the Antigravity IDE, installed and signed in with your Google account.** The ACP server rides the IDE's Google sign-in — that is the supported path, and the one verified against the current server (1.2.1). The plugin downloads Google's official `agy_acp_server.par` itself; the IDE is not driven by the plugin, it is where the credential lives.
+
+## Requirements
+
+- **Antigravity IDE, installed and signed in.** See the note above. Sign in to the plugin with *Sign in with Google* (or *Use Antigravity's current Google sign-in*); on a machine where the IDE is signed in, the server answers at once.
+- **Bun** — magpie runs plugins on it and installs it for you.
+- **`unzip`** (Linux only) for the one-time runtime extraction.
+- First sign-in downloads the official ACP server (~112 MB archive, ~400 MB on disk, macOS arm64) to `~/.local/opt/agy-acp/`.
+
 ## How it works
 
-- **Sign-in**: the ACP server owns the Google sign-in and decides alone where it keeps it (an install with the IDE signed in may carry no token file at all); the plugin stores a marker, never a token, and reads the sign-in's health from the server's own answers — a session can be made signed-out, but only a credential gets a prompt through. One Google sign-in is shared by every account of this provider on a machine. Three ways to sign in:
-  - *Sign in with Google* — the server opens a browser. On SSH or a headless Linux the OAuth URL is captured and shown instead; paste the final localhost URL back.
+- **Sign-in**: the ACP server owns the Google sign-in and decides alone where it keeps it (an install with the IDE signed in usually carries no token file at all); the plugin stores a marker, never a token, and reads the sign-in's health from the server's own answers — a session can be made signed-out, but only a credential gets a prompt through. One Google sign-in is shared by every account of this provider on a machine. Three ways to sign in:
+  - *Sign in with Google* — the server authenticates against the credential the signed-in IDE provides, and answers at once; without one it drives the browser itself. On SSH or a headless Linux the OAuth URL is captured and shown instead; paste the final localhost URL back.
   - *Use Antigravity's current Google sign-in* — a sign-in the Antigravity IDE already made on this machine.
   - *Gemini API key* — authenticated to the server with `_meta.api-key`.
 - **Runtime**: found first to last at `AGY_ACP_BIN`, `~/.local/opt/agy-acp/current`, `~/.local/bin/agy_acp_server.par`, `PATH`. When none is there, the release pinned in `runtime-manifest.json` (SHA-256 and exact sizes checked, the extracted server validated over ACP before use) is downloaded to `~/.local/opt/agy-acp/versions/` and linked as `current`. Linux extraction needs `unzip` on the machine.
@@ -21,6 +30,23 @@ Modeled on `pi-antigravity-acp-provider`, reshaped for magpie's plugin contract.
 - One Google sign-in per machine, shared by all accounts of this provider; "another account" means signing the machine in as someone else.
 - Antigravity's own file and shell tools never run; a model that insists on them will say it couldn't. The client agent's tools are the ones served.
 - Sessions are not warmed across requests: each request carries its conversation as context, as a stateless model API would.
+
+## Ban risk, and magpie's built-in Antigravity
+
+What gets accounts suspended is Google seeing the account used outside Antigravity. magpie's built-in `antigravity` provider says so itself ("use one you can afford to lose"): it connects to Google's Code Assist API with its own code, wearing a spoofed `antigravity/hub/<version>` user agent.
+
+This plugin is one notch safer on that axis — every byte to Google comes from Google's own server binary, through the server's own authentication, into the same conversation store the IDE uses. **It is not zero**: the server still sees an outside agent's system prompts and tool schemas, a scripted calling rhythm, and a client whose name is not the IDE, and Google can add server-side checks at any time. Both providers can coexist; keep the accounts separate, and use an account you can afford to lose.
+
+| | built-in `antigravity` | this plugin `antigravity-acp` |
+| --- | --- | --- |
+| talks to Google as | magpie's own code, spoofed IDE headers | the official ACP server binary |
+| authentication | the account's OAuth token, refreshed by magpie | the server's own flow, riding the IDE's Google sign-in |
+| accounts | a pool, per-account model catalogs merged | one Google sign-in per machine, shared |
+| models | account-pool merge, magpie's own family folding | the server's live rollout catalog, folded in the plugin |
+| usage | quota endpoints, tier cards | the quota each prompt answer carries |
+| tool calls | served to the model API | the client's tools over a loopback MCP bridge; Antigravity's own tools are turned down |
+| third-party account import | yes (Antigravity Manager, CLIProxyAPI) | no — the sign-in belongs to the server |
+| extra deps | none | the downloaded official runtime (~400 MB) + one child process |
 
 ## Environment
 
